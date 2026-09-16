@@ -1,0 +1,11 @@
+# Crash dumps from git bash on Windows
+*.stackdump
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# MIDI files are user content, not part of the addon
+*.mid
+*.midi
