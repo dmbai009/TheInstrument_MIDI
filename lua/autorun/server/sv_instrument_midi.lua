@@ -1,7 +1,10 @@
 -- ============================================================================
--- The Instrument Midi Choser - Server Sync Relay by dmbai (Phase-Locked)
+-- The Instrument MIDI Chooser - server sync relay by dmbai
 -- ============================================================================
 if CLIENT then return end
+
+AddCSLuaFile("the_instrument_midi/midi_core.lua")
+local MIDI_Core = include("the_instrument_midi/midi_core.lua")
 
 util.AddNetworkString("TheInstrument_MIDI_Band_Action")
 util.AddNetworkString("TheInstrument_MIDI_Sync_RequestJoin")
@@ -16,6 +19,7 @@ local MIDI_MAX_CHUNKS   = 24
 local MIDI_JOIN_TIMEOUT = 20
 local MIDI_MAX_SESSIONS_PER_HOST = 16
 local MIDI_NAME_MAX_LEN          = 64
+local MIDI_CHUNK_MIN_INTERVAL    = 0.02
 
 local cvActionCooldown = CreateConVar("theinstrument_midi_action_cooldown", "0.2",
     bit.bor(FCVAR_ARCHIVE, FCVAR_NOTIFY), "Cooldown for play/stop actions.", 0, 10)
@@ -27,7 +31,7 @@ local cvJoinCooldown = CreateConVar("theinstrument_midi_join_cooldown", "1",
     bit.bor(FCVAR_ARCHIVE, FCVAR_NOTIFY), "Cooldown for join requests.", 0, 30)
 
 local cvPatchRelay = CreateConVar("theinstrument_midi_patch_relay", "1",
-    bit.bor(FCVAR_ARCHIVE, FCVAR_NOTIFY), "1 = unreliable patched relay.", 0, 1)
+    bit.bor(FCVAR_ARCHIVE, FCVAR_NOTIFY), "1 = unreliable validated relay; 0 = reliable validated relay.", 0, 1)
 
 local cvNoteRate = CreateConVar("theinstrument_midi_note_rate", "120",
     bit.bor(FCVAR_ARCHIVE, FCVAR_NOTIFY), "Max notes per second.", 0, 1000)
@@ -36,10 +40,7 @@ local cvNoteRadius = CreateConVar("theinstrument_midi_note_radius", "2500",
     bit.bor(FCVAR_ARCHIVE, FCVAR_NOTIFY), "Audible radius.", 0, 32768)
 
 local function IsFiniteNumber(v)
-    if type(v) ~= "number" then return false end
-    if v ~= v then return false end
-    if v == math.huge or v == -math.huge then return false end
-    return true
+    return MIDI_Core.IsFiniteNumber(v)
 end
 
 local function SafeNumber(v, fallback, minv, maxv)
@@ -48,14 +49,37 @@ local function SafeNumber(v, fallback, minv, maxv)
 end
 
 local function SanitizeName(str)
-    if type(str) ~= "string" then return "" end
-    str = string.sub(str, 1, MIDI_NAME_MAX_LEN)
-    str = string.gsub(str, "[%z\1-\31\127]", "")
+    if not MIDI_Core.IsSafeMIDIFilename(str, MIDI_NAME_MAX_LEN) then return nil end
     return str
 end
 
 local function IsLivePlayer(ent)
     return IsValid(ent) and ent:IsPlayer()
+end
+
+local VALID_INSTRUMENT_CLASSES = {
+    ["weapon_the_instrument"] = true,
+    ["weapon_the_instrument_controller"] = true,
+}
+
+local function IsOwnedInstrument(wep, ply)
+    if not IsValid(wep) or not IsLivePlayer(ply) then return false end
+    if not VALID_INSTRUMENT_CLASSES[wep:GetClass()] then return false end
+    if wep.GetOwner and wep:GetOwner() == ply then return true end
+    return ply.ActiveInstrument == wep
+end
+
+local function HasOwnedInstrument(ply)
+    if not IsLivePlayer(ply) then return false end
+    if IsOwnedInstrument(ply:GetActiveWeapon(), ply) then return true end
+    return IsOwnedInstrument(ply.ActiveInstrument, ply)
+end
+
+local function IsAllowedSpeaker(wep, speaker)
+    if not IsValid(speaker) then return true end
+    if not wep.GetHasParentAmp or not wep:GetHasParentAmp() then return false end
+    if not wep.GetParentAmp then return false end
+    return wep:GetParentAmp() == speaker
 end
 
 local nextAction = {}
@@ -170,6 +194,7 @@ net.Receive("TheInstrument_MIDI_Band_Action", function(len, host)
     if action == "play" then
         local songName = SanitizeName(net.ReadString())
         local speed = SafeNumber(net.ReadFloat(), 1, 0.1, 4)
+        if not songName or not HasOwnedInstrument(host) then return end
 
         host:SetNW2Bool("MIDI_IsPlaying", true)
         host:SetNW2Bool("MIDI_IsPaused", false)
@@ -184,6 +209,7 @@ net.Receive("TheInstrument_MIDI_Band_Action", function(len, host)
         net.Broadcast()
 
     elseif action == "seek" then
+        if not host:GetNW2Bool("MIDI_IsPlaying") then return end
         local targetTime = SafeNumber(net.ReadFloat(), 0, 0, 86400)
         net.Start("TheInstrument_MIDI_Band_Action")
             net.WriteEntity(host)
@@ -192,6 +218,7 @@ net.Receive("TheInstrument_MIDI_Band_Action", function(len, host)
         net.Broadcast()
 
     elseif action == "pause" then
+        if not host:GetNW2Bool("MIDI_IsPlaying") then return end
         local isPaused = net.ReadBool() and true or false
         host:SetNW2Bool("MIDI_IsPaused", isPaused)
 
@@ -202,6 +229,7 @@ net.Receive("TheInstrument_MIDI_Band_Action", function(len, host)
         net.Broadcast()
 
     elseif action == "speed" then
+        if not host:GetNW2Bool("MIDI_IsPlaying") then return end
         local speed = SafeNumber(net.ReadFloat(), 1, 0.1, 4)
         local curTime = SafeNumber(net.ReadFloat(), 0, 0, 86400)
         host:SetNW2Float("MIDI_Speed", speed)
@@ -214,6 +242,7 @@ net.Receive("TheInstrument_MIDI_Band_Action", function(len, host)
         net.Broadcast()
 
     elseif action == "sync" then
+        if not host:GetNW2Bool("MIDI_IsPlaying") then return end
         local curTime = SafeNumber(net.ReadFloat(), 0, 0, 86400)
         net.Start("TheInstrument_MIDI_Band_Action", true)
             net.WriteEntity(host)
@@ -251,7 +280,11 @@ net.Receive("TheInstrument_MIDI_Sync_RequestJoin", function(len, requester)
         return
     end
 
-    sessions[requester] = { t = CurTime(), expected = 0 }
+    sessions[requester] = {
+        t = CurTime(),
+        expected = 0,
+        transfer = nil,
+    }
 
     net.Start("TheInstrument_MIDI_Sync_RequestJoin")
         net.WriteEntity(requester)
@@ -269,6 +302,10 @@ net.Receive("TheInstrument_MIDI_Sync_SendJoinData", function(len, host)
     local totalChunks = net.ReadUInt(8)
 
     if not IsLivePlayer(host) or not IsLivePlayer(requester) then return end
+    if not songName then
+        ClearSession(host, requester)
+        return
+    end
 
     local session = GetSession(host, requester)
     if not session then return end
@@ -282,6 +319,7 @@ net.Receive("TheInstrument_MIDI_Sync_SendJoinData", function(len, host)
             return
         end
         session.expected = totalChunks
+        session.transfer = MIDI_Core.NewTransferState(totalChunks)
         session.t = CurTime()
     else
         totalChunks = 0
@@ -314,10 +352,24 @@ net.Receive("TheInstrument_MIDI_Sync_Chunk", function(len, host)
     if not IsLivePlayer(host) or not IsLivePlayer(requester) then return end
 
     local session = GetSession(host, requester)
-    if not session or session.expected < 1 then return end
+    if not session or session.expected < 1 or not session.transfer then return end
     if chunkIndex < 1 or chunkIndex > session.expected then return end
 
-    session.t = CurTime()
+    local now = CurTime()
+    local accepted, complete = MIDI_Core.AcceptTransferChunk(
+        session.transfer,
+        chunkIndex,
+        dataLen,
+        now,
+        { maxChunkBytes = MIDI_CHUNK_SIZE, minInterval = MIDI_CHUNK_MIN_INTERVAL }
+    )
+    if not accepted then
+        if session.transfer.seen[chunkIndex] then return end
+        ClearSession(host, requester)
+        return
+    end
+
+    session.t = now
 
     net.Start("TheInstrument_MIDI_Sync_Chunk")
         net.WriteEntity(host)
@@ -326,7 +378,7 @@ net.Receive("TheInstrument_MIDI_Sync_Chunk", function(len, host)
         net.WriteData(part, dataLen)
     net.Send(requester)
 
-    if chunkIndex == session.expected then
+    if complete then
         ClearSession(host, requester)
     end
 end)
@@ -409,15 +461,9 @@ local function MIDI_NotePlayServer(len, ply)
     if type(sound_file) ~= "string" then return end
     if level == nil or pitch == nil or volume == nil or channel == nil then return end
 
-    if not cvPatchRelay:GetBool() then
-        net.Start("music_mode_note_play_client")
-            WriteNotePayload(wep, own, sound_file, level, pitch, volume,
-                             channel, abs_pitch, inst_id, degree, speaker)
-        net.Broadcast()
-        return
-    end
-
     if own ~= ply then return end
+    if not IsOwnedInstrument(wep, ply) then return end
+    if not IsAllowedSpeaker(wep, speaker) then return end
     if not string.match(sound_file, SOUND_PATTERN) then return end
     if not IsFiniteNumber(volume) or not IsFiniteNumber(abs_pitch) then return end
 
@@ -441,7 +487,7 @@ local function MIDI_NotePlayServer(len, ply)
     local targets = GetNoteListeners(own, origin, cvNoteRadius:GetFloat())
     if #targets == 0 then return end
 
-    net.Start("music_mode_note_play_client", true)
+    net.Start("music_mode_note_play_client", cvPatchRelay:GetBool())
         WriteNotePayload(wep, own, sound_file, level, pitch, volume,
                          channel, abs_pitch, inst_id, degree, speaker)
     net.Send(targets)

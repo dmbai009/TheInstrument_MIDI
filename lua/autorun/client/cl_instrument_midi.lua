@@ -1,7 +1,9 @@
 -- ============================================================================
--- The Instrument Midi Choser by dmbai (Band Full Lockdown Edition)
+-- The Instrument MIDI Chooser by dmbai
 -- ============================================================================
 if SERVER then return end
+
+local MIDI_Core = include("the_instrument_midi/midi_core.lua")
 
 file.CreateDir("the_instrument_midi")
 
@@ -12,12 +14,14 @@ local MIDI_JOIN_TIMEOUT = 20
 local MIDI_CHUNK_DELAY  = 0.2
 local MIDI_SCAN_INTERVAL = 0.25
 local MIDI_FRAME_BUDGET = 16
+local MIDI_EVENT_SCAN_BUDGET = 512
 local MIDI_DROP_WARN_AT = 96
 local MIDI_DROP_WARN_COOLDOWN = 20
 
 local MIDI_MAX_FILE_BYTES = 4 * 1024 * 1024
 local MIDI_MAX_NOTES      = 200000
-local MIDI_MAX_RESYNC     = 262144
+local MIDI_MAX_DURATION   = 86400
+local MIDI_MAX_DECOMPRESSED_BYTES = 16 * 1024 * 1024
 
 local cvNoteRate = CreateClientConVar("theinstrument_midi_note_rate", "80", true, false,
     "Maximum MIDI notes per second this client emits.")
@@ -137,179 +141,15 @@ local function FormatTime(sec)
 end
 
 -- ----------------------------------------------------------------------------
--- 1. BINARY MIDI PARSER
+-- 1. TESTABLE MIDI CORE
 -- ----------------------------------------------------------------------------
 local function ParseMIDI(data)
-    if type(data) ~= "string" then return nil, "No file data" end
-    local len = #data
-    if len < 14 then return nil, "File is too small to be a MIDI" end
-    if len > MIDI_MAX_FILE_BYTES then
-        return nil, "File is too large (" .. math.Round(len / 1024) .. " KB)"
-    end
-
-    local pos = 1
-
-    local function readByte()
-        if pos > len then return 0 end
-        local b = string.byte(data, pos)
-        pos = pos + 1
-        return b
-    end
-    local function readStr(n)
-        if n <= 0 then return "" end
-        local s = string.sub(data, pos, pos + n - 1)
-        pos = pos + n
-        return s
-    end
-    local function readInt16()
-        local b1, b2 = readByte(), readByte()
-        return bit.lshift(b1, 8) + b2
-    end
-    local function readInt32()
-        local b1, b2, b3, b4 = readByte(), readByte(), readByte(), readByte()
-        return b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
-    end
-    local function readVLQ()
-        local val = 0
-        for _ = 1, 4 do
-            local b = readByte()
-            val = val * 128 + bit.band(b, 0x7F)
-            if bit.band(b, 0x80) == 0 then break end
-        end
-        return val
-    end
-
-    if readStr(4) ~= "MThd" then return nil, "Invalid MIDI file format" end
-    readInt32()
-    readInt16()
-    local numTracks = readInt16()
-    local division = readInt16()
-
-    if bit.band(division, 0x8000) ~= 0 then division = 96 end
-    if division <= 0 then division = 96 end
-
-    if numTracks <= 0 then numTracks = 1 end
-    if numTracks > 512 then numTracks = 512 end
-
-    local function FindTrack()
-        local scanned = 0
-        while pos + 3 <= len do
-            if string.sub(data, pos, pos + 3) == "MTrk" then
-                pos = pos + 4
-                return true
-            end
-            pos = pos + 1
-            scanned = scanned + 1
-            if scanned > MIDI_MAX_RESYNC then return false end
-        end
-        return false
-    end
-
-    local allEvents = {}
-    local seq = 0
-
-    for _ = 1, numTracks do
-        if not FindTrack() then break end
-
-        local trkLen = readInt32()
-        if trkLen < 0 or trkLen > len then trkLen = len end
-
-        local endPos = pos + trkLen
-        if endPos > len + 1 then endPos = len + 1 end
-
-        local runningStatus = 0
-        local absTicks = 0
-        local guard = 0
-
-        while pos < endPos and pos <= len do
-            guard = guard + 1
-            if guard > len + 16 then break end
-
-            absTicks = absTicks + readVLQ()
-            local status = readByte()
-            if status < 0x80 then
-                pos = pos - 1
-                status = runningStatus
-            else
-                runningStatus = status
-            end
-
-            local eventType = bit.band(status, 0xF0)
-            local channel = bit.band(status, 0x0F)
-
-            if status == 0xFF then
-                local metaType = readByte()
-                local metaLen = readVLQ()
-                if metaLen < 0 then metaLen = 0 end
-                if metaLen > len then metaLen = len end
-                local metaData = readStr(metaLen)
-                if metaType == 0x51 and #metaData >= 3 then
-                    local b1, b2, b3 = string.byte(metaData, 1, 3)
-                    local us = b1 * 65536 + b2 * 256 + b3
-                    if us > 0 then
-                        seq = seq + 1
-                        allEvents[#allEvents + 1] = { ticks = absTicks, seq = seq, type = "tempo", tempo = us }
-                    end
-                end
-            elseif status == 0xF0 or status == 0xF7 then
-                local sysLen = readVLQ()
-                if sysLen < 0 then sysLen = 0 end
-                if sysLen > len then sysLen = len end
-                readStr(sysLen)
-            elseif eventType == 0x90 then
-                local note, vel = readByte(), readByte()
-                seq = seq + 1
-                allEvents[#allEvents + 1] = {
-                    ticks = absTicks, seq = seq,
-                    type = (vel > 0 and "on" or "off"),
-                    note = note, vel = vel, channel = channel
-                }
-            elseif eventType == 0x80 then
-                local note, vel = readByte(), readByte()
-                seq = seq + 1
-                allEvents[#allEvents + 1] = {
-                    ticks = absTicks, seq = seq, type = "off",
-                    note = note, vel = vel, channel = channel
-                }
-            elseif eventType == 0xC0 or eventType == 0xD0 then
-                readByte()
-            else
-                readByte()
-                readByte()
-            end
-
-            if #allEvents > MIDI_MAX_NOTES * 2 then break end
-        end
-
-        pos = endPos
-    end
-
-    if #allEvents == 0 then return nil, "No playable MIDI events found" end
-
-    table.sort(allEvents, function(a, b)
-        if a.ticks == b.ticks then return a.seq < b.seq end
-        return a.ticks < b.ticks
-    end)
-
-    local curTempo, curTime, lastTicks = 500000, 0, 0
-    local notes = {}
-
-    for _, ev in ipairs(allEvents) do
-        local deltaTicks = ev.ticks - lastTicks
-        if deltaTicks < 0 then deltaTicks = 0 end
-        curTime = curTime + (deltaTicks * (curTempo / (division * 1000000)))
-        lastTicks = ev.ticks
-
-        if ev.type == "tempo" then
-            curTempo = ev.tempo
-        elseif ev.type == "on" then
-            notes[#notes + 1] = { time = curTime, note = ev.note, vel = ev.vel, channel = ev.channel or 0 }
-            if #notes >= MIDI_MAX_NOTES then break end
-        end
-    end
-
-    if #notes == 0 then return nil, "MIDI contains no note-on events" end
-    return notes
+    return MIDI_Core.ParseMIDI(data, {
+        maxFileBytes = MIDI_MAX_FILE_BYTES,
+        maxNotes = MIDI_MAX_NOTES,
+        maxEvents = MIDI_MAX_NOTES * 2,
+        maxDuration = MIDI_MAX_DURATION,
+    })
 end
 
 -- ----------------------------------------------------------------------------
@@ -415,14 +255,7 @@ function MIDI_Engine:Seek(targetTime)
     if not self.Song or self.TotalDuration <= 0 then return end
     self.CurrentTime = math.Clamp(targetTime, 0, self.TotalDuration)
 
-    local newIdx = #self.Song + 1
-    for i, ev in ipairs(self.Song) do
-        if ev.time >= self.CurrentTime then
-            newIdx = i
-            break
-        end
-    end
-    self.Index = newIdx
+    self.Index = MIDI_Core.LowerBound(self.Song, self.CurrentTime)
 
     RefillNoteTokens()
     self.DroppedNotes = 0
@@ -549,7 +382,7 @@ local function BuildNoteChunks(song)
     end
 
     local json = util.TableToJSON(simple)
-    if not json then return nil, 0 end
+    if not json or #json > MIDI_MAX_DECOMPRESSED_BYTES then return nil, 0 end
 
     local comp = util.Compress(json)
     if not comp or #comp == 0 then return nil, 0 end
@@ -577,6 +410,10 @@ local function JoinBandWithPlayer(target)
     if not IsValid(target) or not target:GetNW2Bool("MIDI_IsPlaying") then return end
 
     local songName = target:GetNW2String("MIDI_SongName", "")
+    if not MIDI_Core.IsSafeMIDIFilename(songName) then
+        chat.AddText(Color(255, 150, 100), "[MIDI Band] Host announced an unsafe song name.")
+        return
+    end
     local hasLocal = songName ~= "" and file.Exists("the_instrument_midi/" .. songName, "DATA")
 
     pendingJoin = {
@@ -586,6 +423,7 @@ local function JoinBandWithPlayer(target)
         expected = nil,
         chunks = {},
         got = 0,
+        receivedBytes = 0,
     }
 
     chat.AddText(Color(255, 210, 80), "[MIDI Band] Connecting to " .. target:Nick() .. "...")
@@ -627,12 +465,13 @@ net.Receive("TheInstrument_MIDI_Sync_RequestJoin", function()
     if not hasNotes then return end
 
     for i = 1, count do
+        local chunkIndex = i
         local part = chunks[i]
         timer.Simple((i - 1) * MIDI_CHUNK_DELAY, function()
             if not IsValid(requester) then return end
             net.Start("TheInstrument_MIDI_Sync_Chunk")
                 net.WriteEntity(requester)
-                net.WriteUInt(i, 8)
+                net.WriteUInt(chunkIndex, 8)
                 net.WriteUInt(#part, 16)
                 net.WriteData(part, #part)
             net.SendToServer()
@@ -658,27 +497,34 @@ local function FinishPendingJoin()
     local isPaused = pendingJoin.isPaused
     pendingJoin = nil
 
-    local json = comp and util.Decompress(comp)
-    if not json then
+    if not comp or #comp > MIDI_CHUNK_SIZE * MIDI_MAX_CHUNKS then
+        chat.AddText(Color(255, 80, 80), "[MIDI Band] Received song data was too large.")
+        return
+    end
+
+    local decompressed, json = pcall(util.Decompress, comp, MIDI_MAX_DECOMPRESSED_BYTES)
+    if not decompressed or not json or #json > MIDI_MAX_DECOMPRESSED_BYTES then
         chat.AddText(Color(255, 80, 80), "[MIDI Band] Received song data was corrupt.")
         return
     end
 
-    local simple = util.JSONToTable(json)
-    if not istable(simple) or #simple == 0 then
+    local decoded, simple = pcall(util.JSONToTable, json)
+    if not decoded or not istable(simple) or #simple == 0 then
         chat.AddText(Color(255, 80, 80), "[MIDI Band] Received song data was unreadable.")
         return
     end
 
-    local song = {}
-    for i = 1, #simple do
-        local n = simple[i]
-        if istable(n) and n[1] and n[2] then
-            song[#song + 1] = { time = n[1], note = n[2], vel = n[3] or 100, channel = n[4] or 0 }
-        end
+    local song, validationError = MIDI_Core.ValidateSong(simple, {
+        maxNotes = MIDI_MAX_NOTES,
+        maxDuration = MIDI_MAX_DURATION,
+    })
+    if not song then
+        chat.AddText(Color(255, 80, 80),
+            "[MIDI Band] Received song data was invalid: " .. (validationError or "unknown error"))
+        return
     end
 
-    if #song == 0 or not IsValid(host) then return end
+    if not IsValid(host) then return end
 
     local latency = math.max(0, (host:Ping() + LocalPlayer():Ping()) / 2000)
     local compensatedTime = curTime + (latency * speed)
@@ -698,6 +544,17 @@ net.Receive("TheInstrument_MIDI_Sync_SendJoinData", function()
 
     if not pendingJoin or pendingJoin.target ~= host then return end
     if not IsValid(host) then AbortPendingJoin("Host disconnected.") return end
+    if not MIDI_Core.IsSafeMIDIFilename(songName) then
+        AbortPendingJoin("Host announced an unsafe song name.")
+        return
+    end
+    if not MIDI_Core.IsFiniteNumber(curTime) or not MIDI_Core.IsFiniteNumber(speed) then
+        AbortPendingJoin("Host announced invalid playback state.")
+        return
+    end
+
+    curTime = math.Clamp(curTime, 0, MIDI_MAX_DURATION)
+    speed = math.Clamp(speed, 0.1, 4)
 
     pendingJoin.t = CurTime()
     pendingJoin.songName = songName
@@ -734,23 +591,30 @@ net.Receive("TheInstrument_MIDI_Sync_SendJoinData", function()
     pendingJoin.expected = totalChunks
     pendingJoin.chunks = {}
     pendingJoin.got = 0
+    pendingJoin.receivedBytes = 0
 end)
 
 net.Receive("TheInstrument_MIDI_Sync_Chunk", function()
     local host = net.ReadEntity()
     local index = net.ReadUInt(8)
-    local dataLen = math.Clamp(net.ReadUInt(16), 0, MIDI_CHUNK_SIZE)
+    local dataLen = net.ReadUInt(16)
+    if dataLen < 1 or dataLen > MIDI_CHUNK_SIZE then return end
     local part = dataLen > 0 and net.ReadData(dataLen) or ""
 
     if not pendingJoin or pendingJoin.target ~= host then return end
     if not pendingJoin.expected or index < 1 or index > pendingJoin.expected then return end
-    if dataLen < 1 then return end
+    if type(part) ~= "string" or #part ~= dataLen then return end
+    if pendingJoin.receivedBytes + dataLen > pendingJoin.expected * MIDI_CHUNK_SIZE then
+        AbortPendingJoin("Host sent too much song data.")
+        return
+    end
 
     pendingJoin.t = CurTime()
 
     if pendingJoin.chunks[index] == nil then
         pendingJoin.chunks[index] = part
         pendingJoin.got = pendingJoin.got + 1
+        pendingJoin.receivedBytes = pendingJoin.receivedBytes + dataLen
     end
 
     if pendingJoin.got >= pendingJoin.expected then
@@ -780,24 +644,22 @@ net.Receive("TheInstrument_MIDI_Band_Action", function()
     elseif action == "speed" then
         local speed = net.ReadFloat()
         local curTime = net.ReadFloat()
+        if not MIDI_Core.IsFiniteNumber(speed) or not MIDI_Core.IsFiniteNumber(curTime) then return end
+        speed = math.Clamp(speed, 0.1, 4)
+        curTime = math.Clamp(curTime, 0, MIDI_MAX_DURATION)
 
         local latency = math.max(0, (host:Ping() + LocalPlayer():Ping()) / 2000)
         MIDI_Engine.Speed = speed
         MIDI_Engine.CurrentTime = curTime + (latency * speed)
 
-        local newIdx = #MIDI_Engine.Song + 1
-        for i, ev in ipairs(MIDI_Engine.Song) do
-            if ev.time >= MIDI_Engine.CurrentTime then
-                newIdx = i
-                break
-            end
-        end
-        MIDI_Engine.Index = newIdx
+        MIDI_Engine.Index = MIDI_Core.LowerBound(MIDI_Engine.Song, MIDI_Engine.CurrentTime)
 
         if IsValid(activeSpeedSlider) then activeSpeedSlider:SetValue(speed) end
 
     elseif action == "sync" then
         local hostTime = net.ReadFloat()
+        if not MIDI_Core.IsFiniteNumber(hostTime) then return end
+        hostTime = math.Clamp(hostTime, 0, MIDI_MAX_DURATION)
         if not MIDI_Engine.IsPaused and MIDI_Engine.Song then
             local latency = math.max(0, (host:Ping() + LocalPlayer():Ping()) / 2000)
             local expectedTime = hostTime + (latency * MIDI_Engine.Speed)
@@ -805,14 +667,7 @@ net.Receive("TheInstrument_MIDI_Band_Action", function()
 
             if math.abs(drift) > 0.035 then
                 MIDI_Engine.CurrentTime = expectedTime
-                local newIdx = #MIDI_Engine.Song + 1
-                for i, ev in ipairs(MIDI_Engine.Song) do
-                    if ev.time >= expectedTime then
-                        newIdx = i
-                        break
-                    end
-                end
-                MIDI_Engine.Index = newIdx
+                MIDI_Engine.Index = MIDI_Core.LowerBound(MIDI_Engine.Song, expectedTime)
             end
         end
 
@@ -867,7 +722,7 @@ local function OpenMIDIMenu()
     TheInstrument_MIDI_Panels.menuFrame = frame
     frame:SetSize(450, 600)
     frame:Center()
-    frame:SetTitle("The Instrument Midi Choser by dmbai")
+    frame:SetTitle("The Instrument MIDI Chooser by dmbai")
     frame:MakePopup()
 
     SuppressInstrumentKeyboard()
@@ -922,7 +777,12 @@ local function OpenMIDIMenu()
 
     local function PopulateList(filter)
         list:Clear()
-        local files = file.Find("the_instrument_midi/*.mid", "DATA")
+        local files = file.Find("the_instrument_midi/*.mid", "DATA") or {}
+        local longExtensionFiles = file.Find("the_instrument_midi/*.midi", "DATA")
+        for _, filename in ipairs(longExtensionFiles or {}) do
+            files[#files + 1] = filename
+        end
+        table.sort(files)
         for _, f in ipairs(files) do
             if not filter or filter == "" or string.find(string.lower(f), string.lower(filter), 1, true) then
                 list:AddLine(f)
@@ -1461,10 +1321,19 @@ hook.Add("Think", "TheInstrument_MIDI_Control_Think", function()
     local dropped = 0
     local song = MIDI_Engine.Song
     local total = #song
+    local scanned = 0
 
     while MIDI_Engine.Index <= total do
         local ev = song[MIDI_Engine.Index]
         if ev.time > MIDI_Engine.CurrentTime then break end
+
+        scanned = scanned + 1
+        if scanned > MIDI_EVENT_SCAN_BUDGET then
+            local nextIndex = MIDI_Core.UpperBound(song, MIDI_Engine.CurrentTime, MIDI_Engine.Index)
+            dropped = dropped + math.max(0, nextIndex - MIDI_Engine.Index)
+            MIDI_Engine.Index = nextIndex
+            break
+        end
 
         if MIDI_Engine.MuteDrums and ev.channel == 9 then
             MIDI_Engine.Index = MIDI_Engine.Index + 1
@@ -1474,8 +1343,10 @@ hook.Add("Think", "TheInstrument_MIDI_Control_Think", function()
             MIDI_Engine.NoteTokens = MIDI_Engine.NoteTokens - 1
             MIDI_Engine.Index = MIDI_Engine.Index + 1
         else
-            MIDI_Engine.Index = MIDI_Engine.Index + 1
-            dropped = dropped + 1
+            local nextIndex = MIDI_Core.UpperBound(song, MIDI_Engine.CurrentTime, MIDI_Engine.Index)
+            dropped = dropped + math.max(1, nextIndex - MIDI_Engine.Index)
+            MIDI_Engine.Index = nextIndex
+            break
         end
     end
 

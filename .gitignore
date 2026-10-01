@@ -9,3 +9,6 @@ desktop.ini
 # MIDI files are user content, not part of the addon
 *.mid
 *.midi
+
+# Local Workshop build output
+*.gma

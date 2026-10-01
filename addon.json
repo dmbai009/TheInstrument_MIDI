@@ -1,0 +1,17 @@
+{
+  "title": "The Instrument - MIDI Chooser",
+  "type": "tool",
+  "tags": [
+    "fun",
+    "roleplay"
+  ],
+  "ignore": [
+    ".git/*",
+    ".github/*",
+    "tests/*",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "thumbnail.png"
+  ]
+}
