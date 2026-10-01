@@ -9,7 +9,7 @@
   <br>
   <a href="https://steamcommunity.com/sharedfiles/filedetails/?id=3801703385"><strong>Steam Workshop</strong></a>
   ·
-  <a href="https://github.com/PinheadLarry1924/instrument">Required: The Instrument</a>
+  <a href="https://steamcommunity.com/workshop/filedetails/?id=2718124784">Required: The Instrument</a>
 </p>
 
 ## What it does
@@ -33,7 +33,7 @@ times out after 20 seconds and validates the decompressed note data before playb
 
 ### Steam Workshop
 
-1. Install [The Instrument](https://github.com/PinheadLarry1924/instrument).
+1. Subscribe to [The Instrument](https://steamcommunity.com/workshop/filedetails/?id=2718124784).
 2. Subscribe to [The Instrument — MIDI Chooser](https://steamcommunity.com/sharedfiles/filedetails/?id=3801703385).
 3. Restart Garry's Mod if it was already running.
 
